@@ -1,3 +1,4 @@
+
 import ipaddress
 import re
 import socket
@@ -9,100 +10,160 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 from flask import Flask, jsonify, render_template, request
 from markdown_it import MarkdownIt
 
+
 app = Flask(__name__)
+
 MAX_TEXT_LENGTH = 60000
 MAX_IMAGES = 30
 TIMEOUT_SECONDS = 35
 MAX_REDIRECTS = 5
+
 markdown = MarkdownIt("default")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; LeitorUniversal/2.0; +https://github.com/ezequieltech/Leitor-Universal)"
+    "User-Agent": (
+        "Mozilla/5.0 (compatible; LeitorUniversal/2.0; "
+        "+https://github.com/ezequieltech/Leitor-Universal)"
+    )
 }
 
 
+# ==========================================================
+# 1. VALIDAÇÃO DE ENDEREÇOS
+# ==========================================================
+
 def validate_public_url(value):
-    """Aceita apenas URLs HTTP(S) públicas."""
+    """Aceita somente URLs HTTP/HTTPS com endereços IP públicos."""
+
     if not isinstance(value, str) or len(value) > 2048:
         raise ValueError("Informe um endereço válido.")
 
-    parsed = urlparse(value.strip())
+    value = value.strip()
+    parsed = urlparse(value)
 
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise ValueError("Use um endereço iniciado por http:// ou https://.")
+        raise ValueError(
+            "Use um endereço iniciado por http:// ou https://."
+        )
 
     if parsed.username or parsed.password:
-        raise ValueError("Endereços com usuário ou senha não são aceitos.")
+        raise ValueError(
+            "Endereços com usuário ou senha não são aceitos."
+        )
 
-    if parsed.port and parsed.port not in (80, 443):
-        raise ValueError("Por segurança, somente as portas 80 e 443 são aceitas.")
+    try:
+        porta = parsed.port
+    except ValueError:
+        raise ValueError("A porta informada não é válida.")
+
+    if porta and porta not in (80, 443):
+        raise ValueError(
+            "Por segurança, somente as portas 80 e 443 são aceitas."
+        )
 
     host = parsed.hostname.rstrip(".").lower()
 
-    if host in ("localhost",) or host.endswith(".localhost") or host.endswith(".local"):
+    if (
+        host == "localhost"
+        or host.endswith(".localhost")
+        or host.endswith(".local")
+    ):
         raise ValueError("Endereços locais não são aceitos.")
 
     try:
-        addresses = socket.getaddrinfo(
+        enderecos = socket.getaddrinfo(
             host,
-            parsed.port or (443 if parsed.scheme == "https" else 80)
+            porta or (443 if parsed.scheme == "https" else 80)
         )
     except socket.gaierror:
-        raise ValueError("Não foi possível localizar esse endereço na internet.")
+        raise ValueError(
+            "Não foi possível localizar esse endereço na internet."
+        )
 
-    for item in addresses:
+    for item in enderecos:
         ip = ipaddress.ip_address(item[4][0])
+
         if not ip.is_global:
             raise ValueError("O endereço informado não é público.")
 
-    return value.strip()
+    return value
 
 
-def get_with_safe_redirects(url, headers=None, timeout=TIMEOUT_SECONDS):
-    current = validate_public_url(url)
+# ==========================================================
+# 2. ACESSO A PÁGINAS COM REDIRECIONAMENTOS
+# ==========================================================
+
+def get_with_safe_redirects(
+    url,
+    headers=None,
+    timeout=TIMEOUT_SECONDS
+):
+    atual = validate_public_url(url)
 
     for _ in range(MAX_REDIRECTS + 1):
-        response = requests.get(
-            current,
+
+        resposta = requests.get(
+            atual,
             headers=headers or HEADERS,
             timeout=timeout,
-            allow_redirects=False,
+            allow_redirects=False
         )
 
-        if response.status_code not in (301, 302, 303, 307, 308):
-            response.raise_for_status()
-            return response
+        if resposta.status_code not in (301, 302, 303, 307, 308):
+            resposta.raise_for_status()
+            return resposta
 
-        location = response.headers.get("Location")
+        destino = resposta.headers.get("Location")
 
-        if not location:
-            response.raise_for_status()
+        if not destino:
+            resposta.raise_for_status()
 
-        current = validate_public_url(urljoin(current, location))
+        atual = validate_public_url(
+            urljoin(atual, destino)
+        )
 
-    raise ValueError("A página apresentou redirecionamentos demais.")
+    raise ValueError(
+        "A página apresentou redirecionamentos demais."
+    )
 
+
+# ==========================================================
+# 3. IDENTIFICAÇÃO DA ÁREA PRINCIPAL
+# ==========================================================
 
 def escolher_area_principal(soup):
+
     candidatos = []
 
-    for seletor in ("article", "main", '[role="main"]'):
+    for seletor in (
+        "article",
+        "main",
+        '[role="main"]'
+    ):
         candidatos.extend(soup.select(seletor))
 
     if candidatos:
         return max(
             candidatos,
-            key=lambda el: len(el.get_text(" ", strip=True))
+            key=lambda elemento: len(
+                elemento.get_text(" ", strip=True)
+            )
         )
 
     return soup.body or soup
 
 
+# ==========================================================
+# 4. IDENTIFICAÇÃO DE IMAGENS E LEGENDAS
+# ==========================================================
+
 def extrair_imagens(area, base_url):
+
     imagens = []
     vistos = set()
 
     for img in area.find_all("img"):
+
         src = (
             img.get("src")
             or img.get("data-src")
@@ -110,16 +171,23 @@ def extrair_imagens(area, base_url):
         )
 
         if not src and img.get("srcset"):
-            src = img.get("srcset").split(",")[0].strip().split(" ")[0]
+            src = (
+                img.get("srcset")
+                .split(",")[0]
+                .strip()
+                .split(" ")[0]
+            )
 
         alt = (img.get("alt") or "").strip()
         title = (img.get("title") or "").strip()
 
         figure = img.find_parent("figure")
+
         legenda = ""
 
         if figure:
             cap = figure.find("figcaption")
+
             if cap:
                 legenda = cap.get_text(" ", strip=True)
 
@@ -129,13 +197,15 @@ def extrair_imagens(area, base_url):
             continue
 
         imagem_url = urljoin(base_url, src) if src else ""
-        parsed = urlparse(imagem_url)
 
-        if imagem_url and (
-            parsed.scheme not in ("http", "https")
-            or not parsed.hostname
-        ):
-            imagem_url = ""
+        if imagem_url:
+            parsed = urlparse(imagem_url)
+
+            if (
+                parsed.scheme not in ("http", "https")
+                or not parsed.hostname
+            ):
+                imagem_url = ""
 
         chave = (descricao, imagem_url)
 
@@ -147,7 +217,7 @@ def extrair_imagens(area, base_url):
         imagens.append({
             "description": descricao[:500],
             "alt": alt[:300],
-            "caption": legenda[:500],
+            "caption": legenda[:500]
         })
 
         if len(imagens) >= MAX_IMAGES:
@@ -156,11 +226,50 @@ def extrair_imagens(area, base_url):
     return imagens
 
 
+# ==========================================================
+# 5. CONVERSÃO DE ELEMENTOS HTML EM TEXTO
+# ==========================================================
+
 def texto_de_elemento(elemento):
+
     partes = []
 
+    descartados = {
+        "script",
+        "style",
+        "noscript",
+        "svg",
+        "iframe",
+        "video",
+        "audio",
+        "nav",
+        "footer",
+        "aside",
+        "form",
+        "button"
+    }
+
+    termos_ruins = (
+        "advert",
+        "ads",
+        "sidebar",
+        "cookie",
+        "newsletter",
+        "social-share",
+        "related",
+        "comments",
+        "breadcrumb",
+        "menu",
+        "share"
+    )
+
+    def texto_inline(no):
+        return no.get_text(" ", strip=True)
+
     def visitar(no):
+
         if isinstance(no, NavigableString):
+
             valor = str(no).strip()
 
             if valor:
@@ -172,30 +281,35 @@ def texto_de_elemento(elemento):
             return
 
         nome = no.name.lower()
-        classes = " ".join(no.get("class", [])).lower()
+
+        classes = " ".join(
+            no.get("class", [])
+        ).lower()
+
         role = (no.get("role") or "").lower()
 
-        descartados = {
-            "script", "style", "noscript", "svg", "iframe",
-            "video", "audio", "nav", "footer", "aside",
-            "form", "button"
-        }
+        # Remove elementos de navegação e publicidade.
 
-        termos_ruins = (
-            "advert", "ads", "sidebar", "cookie", "newsletter",
-            "social-share", "related", "comments", "breadcrumb",
-            "menu", "share"
-        )
+        if nome in descartados:
+            return
 
-        if nome in descartados or role in (
-            "navigation", "banner", "contentinfo"
+        if role in (
+            "navigation",
+            "banner",
+            "contentinfo"
         ):
             return
 
-        if any(t in classes for t in termos_ruins):
+        if any(
+            termo in classes
+            for termo in termos_ruins
+        ):
             return
 
+        # Imagens com descrição textual.
+
         if nome == "img":
+
             alt = (no.get("alt") or "").strip()
 
             if alt:
@@ -203,48 +317,160 @@ def texto_de_elemento(elemento):
 
             return
 
-        if nome in ("h1", "h2", "h3", "h4", "h5", "h6"):
-            partes.append("\n")
+        # Tabelas: transforma linhas e colunas em frases.
 
-            for filho in no.children:
-                visitar(filho)
+        if nome == "table":
+
+            linhas = no.find_all("tr")
+            cabecalhos = []
+
+            if linhas:
+
+                primeira = linhas[0]
+
+                cabecalhos = [
+                    texto_inline(celula)
+                    for celula in primeira.find_all(
+                        ["th", "td"],
+                        recursive=False
+                    )
+                ]
+
+                if primeira.find("th"):
+                    linhas = linhas[1:]
+                else:
+                    cabecalhos = []
+
+            partes.append("\nTabela.\n")
+
+            for linha in linhas:
+
+                celulas = [
+                    texto_inline(celula)
+                    for celula in linha.find_all(
+                        ["th", "td"],
+                        recursive=False
+                    )
+                ]
+
+                if not celulas:
+                    continue
+
+                if (
+                    cabecalhos
+                    and len(cabecalhos) == len(celulas)
+                ):
+
+                    frase = ". ".join(
+                        f"{cabecalhos[i]}: {valor}"
+                        for i, valor in enumerate(celulas)
+                    )
+
+                else:
+
+                    frase = ". ".join(
+                        f"Coluna {i + 1}: {valor}"
+                        for i, valor in enumerate(celulas)
+                    )
+
+                partes.append(frase + ".")
 
             partes.append("\n")
             return
+
+        # Títulos.
 
         if nome in (
-            "p", "li", "tr", "blockquote", "figcaption"
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6"
         ):
-            partes.append("\n")
 
-            for filho in no.children:
-                visitar(filho)
+            conteudo = texto_inline(no)
 
-            partes.append("\n")
+            if conteudo:
+                partes.append("\n" + conteudo + "\n")
+
             return
 
-        if nome in ("td", "th"):
-            partes.append(" | ")
+        # Parágrafos.
 
-            for filho in no.children:
-                visitar(filho)
+        if nome in (
+            "p",
+            "blockquote",
+            "figcaption"
+        ):
 
-            partes.append(" ")
+            conteudo = texto_inline(no)
+
+            if conteudo:
+                partes.append("\n" + conteudo + "\n")
+
             return
+
+        # Listas.
+
+        if nome == "li":
+
+            conteudo = texto_inline(no)
+
+            if conteudo:
+                partes.append("\n• " + conteudo)
+
+            return
+
+        # Quebras de linha.
 
         if nome == "br":
+
             partes.append("\n")
             return
 
+        # Elementos de bloco.
+
         if nome in (
-            "ul", "ol", "table", "thead", "tbody", "tfoot"
+            "ul",
+            "ol",
+            "div",
+            "section",
+            "article",
+            "main",
+            "header",
+            "tbody",
+            "thead",
+            "tfoot",
+            "tr"
         ):
+
             partes.append("\n")
 
             for filho in no.children:
                 visitar(filho)
 
             partes.append("\n")
+            return
+
+        # Elementos em linha.
+
+        if nome in (
+            "strong",
+            "b",
+            "em",
+            "i",
+            "span",
+            "a",
+            "sup",
+            "sub"
+        ):
+
+            conteudo = texto_inline(no)
+
+            if conteudo:
+                partes.append(conteudo)
+
             return
 
         for filho in no.children:
@@ -252,41 +478,121 @@ def texto_de_elemento(elemento):
 
     visitar(elemento)
 
-    return "\n".join(partes)
+    texto = "\n".join(partes)
 
+    texto = re.sub(r"[ \t]+", " ", texto)
+    texto = re.sub(r" *\n *", "\n", texto)
+    texto = re.sub(r"\n{3,}", "\n\n", texto)
+
+    return texto.strip()
+
+
+# ==========================================================
+# 6. CONVERSÃO DE MARKDOWN PARA TEXTO
+# ==========================================================
 
 def markdown_para_texto(conteudo):
+
     html = markdown.render(conteudo or "")
-    soup = BeautifulSoup(html, "html.parser")
+
+    soup = BeautifulSoup(
+        html,
+        "html.parser"
+    )
 
     return texto_de_elemento(soup)
 
 
+# ==========================================================
+# 7. LIMPEZA DE MENUS E ELEMENTOS DESNECESSÁRIOS
+# ==========================================================
+
 def limpar_linhas(texto):
+
     linhas = []
 
+    termos_descartar = [
+        "ir para o conteúdo",
+        "ir para o menu",
+        "ir para a busca",
+        "pular para o conteúdo",
+        "início do menu",
+        "fim do menu",
+        "menu principal",
+        "não pare agora",
+        "tem mais depois da publicidade",
+        "últimas notícias",
+        "alto contraste",
+        "navegar para direita",
+        "cadastre-se",
+        "faça seu login",
+        "leia também:",
+        "veja também:",
+        "clique aqui para visitar",
+        "voltar ao topo"
+    ]
+
     for linha in (texto or "").splitlines():
-        linha = re.sub(r"[ \t]+", " ", linha).strip()
+
+        linha = re.sub(
+            r"[ \t]+",
+            " ",
+            linha
+        ).strip()
 
         if not linha:
+
             if linhas and linhas[-1] != "":
                 linhas.append("")
+
             continue
 
         baixa = linha.lower()
 
-        if baixa in {
-            "ir para o conteúdo",
-            "ir para o menu",
-            "ir para a busca",
-            "pular para o conteúdo",
-            "menu principal",
-            "fim do conteúdo"
-        }:
+        # Remove chamadas de navegação e publicidade.
+
+        if any(
+            termo in baixa
+            for termo in termos_descartar
+        ):
             continue
 
-        if len(linha) > 500 and all(
-            p in baixa for p in ("gov br", "ministério", "ir para")
+        # Remove itens comuns do Gov.br.
+
+        if baixa in (
+            "govbr",
+            "gov.br",
+            "casa civil",
+            "planalto",
+            "início do conteúdo",
+            "fim do conteúdo"
+        ):
+            continue
+
+        if baixa.startswith("ministério "):
+            continue
+
+        if baixa.startswith("secretaria de "):
+            continue
+
+        if baixa.startswith("imagem: image "):
+            continue
+
+        if baixa.startswith("logo ibge"):
+            continue
+
+        # Remove linhas de navegação muito extensas.
+
+        if (
+            len(linha) > 500
+            and all(
+                termo in baixa
+                for termo in (
+                    "gov br",
+                    "ministério",
+                    "ir para"
+                )
+            )
         ):
             continue
 
@@ -295,47 +601,107 @@ def limpar_linhas(texto):
     return "\n".join(linhas).strip()
 
 
+# ==========================================================
+# 8. CORREÇÃO DE ESPAÇAMENTOS E SEPARAÇÕES
+# ==========================================================
+
 def corrigir_separacoes(texto):
+
+    # Remove caracteres invisíveis de quebra opcional.
+
+    texto = texto.replace("\u00ad", "")
+
+    # Junta palavras divididas por hífen no fim de uma linha.
+
     texto = re.sub(
-        r"(?<=[.!?])(?=[A-ZÁÉÍÓÚÂÊÔÃÕÇ])",
+        r"(?<=\w)-\s*\n\s*(?=\w)",
+        "",
+        texto
+    )
+
+    # Corrige espaços indevidos em números decimais.
+
+    texto = re.sub(
+        r"(?<=\d),\s+(?=\d)",
+        ",",
+        texto
+    )
+
+    # Corrige espaços antes do símbolo de porcentagem.
+
+    texto = re.sub(
+        r"(?<=\d)\s+%",
+        "%",
+        texto
+    )
+
+    # Remove espaços duplicados.
+
+    texto = re.sub(
+        r"[ \t]{2,}",
         " ",
         texto
     )
 
-    texto = re.sub(r"(?<=\d),\s+(?=\d)", ",", texto)
-    texto = re.sub(r"(?<=\d)\s+%", "%", texto)
-    texto = re.sub(r"[ \t]{2,}", " ", texto)
-
     return texto
 
 
+# ==========================================================
+# 9. LIMPEZA FINAL DO TEXTO
+# ==========================================================
+
 def limpar_texto(texto):
-    texto = (texto or "").replace("\u00ad", "")
+
     texto = corrigir_separacoes(texto)
+
     texto = limpar_linhas(texto)
-    texto = re.sub(r"\n{3,}", "\n\n", texto)
+
+    texto = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        texto
+    )
 
     return texto.strip()
 
 
+# ==========================================================
+# 10. EXTRAÇÃO PRINCIPAL COM TRAFILATURA
+# ==========================================================
+
 def extrair_com_trafilatura(url):
+
     resposta = get_with_safe_redirects(url)
+
     html = resposta.text
 
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(
+        html,
+        "html.parser"
+    )
 
     titulo = (
         soup.title.get_text(" ", strip=True)
-        if soup.title else ""
+        if soup.title
+        else ""
     )
 
     area = escolher_area_principal(soup)
-    imagens = extrair_imagens(area, resposta.url)
+
+    imagens = extrair_imagens(
+        area,
+        resposta.url
+    )
+
+    # Remove elementos que não fazem parte do artigo.
 
     for no in area.select(
-        "script,style,noscript,nav,footer,aside,form,iframe,video,audio"
+        "script, style, noscript, nav, footer, aside, "
+        "form, iframe, video, audio"
     ):
         no.decompose()
+
+    # Primeira tentativa: Trafilatura.
 
     extraido = trafilatura.extract(
         str(area),
@@ -343,25 +709,50 @@ def extrair_com_trafilatura(url):
         include_tables=True,
         include_links=False,
         favor_precision=True,
-        deduplicate=True,
+        deduplicate=True
     )
 
+    # Segunda tentativa: extração direta do HTML.
+
     if not extraido or len(extraido.strip()) < 80:
-        extraido = texto_de_elemento(area)
+        texto_bruto = texto_de_elemento(area)
+    else:
+        texto_bruto = markdown_para_texto(extraido)
 
-    texto = limpar_texto(markdown_para_texto(extraido))
-    table_count = len(area.find_all("table"))
+    texto = limpar_texto(texto_bruto)
 
-    return texto, titulo, imagens, table_count, resposta.url
+    quantidade_tabelas = len(
+        area.find_all("table")
+    )
 
+    return (
+        texto,
+        titulo,
+        imagens,
+        quantidade_tabelas,
+        resposta.url
+    )
+
+
+# ==========================================================
+# 11. EXTRAÇÃO DE IMAGENS DO MARKDOWN
+# ==========================================================
 
 def extrair_imagens_markdown(conteudo):
+
     imagens = []
 
-    for alt in re.findall(r"!\[([^\]]*)\]\([^)]+\)", conteudo or ""):
+    padrao = r"!\[([^\]]*)\]\([^)]+\)"
+
+    for alt in re.findall(
+        padrao,
+        conteudo or ""
+    ):
+
         alt = alt.strip()
 
         if alt:
+
             imagens.append({
                 "description": alt[:500],
                 "alt": alt[:300],
@@ -374,7 +765,12 @@ def extrair_imagens_markdown(conteudo):
     return imagens
 
 
+# ==========================================================
+# 12. EXTRAÇÃO ALTERNATIVA COM JINA READER
+# ==========================================================
+
 def extrair_com_jina(url):
+
     url_validada = validate_public_url(url)
 
     resposta = requests.get(
@@ -383,10 +779,10 @@ def extrair_com_jina(url):
             "User-Agent": HEADERS["User-Agent"],
             "X-Return-Format": "markdown",
             "X-Remove-Selector": "nav,footer,aside,form",
-            "X-Retain-Images": "all",
+            "X-Retain-Images": "all"
         },
         timeout=TIMEOUT_SECONDS + 10,
-        allow_redirects=False,
+        allow_redirects=False
     )
 
     resposta.raise_for_status()
@@ -401,57 +797,103 @@ def extrair_com_jina(url):
 
     titulo = (
         titulo_match.group(1).strip()
-        if titulo_match else ""
+        if titulo_match
+        else ""
     )
 
-    imagens = extrair_imagens_markdown(conteudo)
-    texto = limpar_texto(markdown_para_texto(conteudo))
+    imagens = extrair_imagens_markdown(
+        conteudo
+    )
+
+    texto = limpar_texto(
+        markdown_para_texto(conteudo)
+    )
 
     tem_tabelas = (
-        len(re.findall(r"^\|.*\|$", conteudo, re.MULTILINE)) > 1
+        len(
+            re.findall(
+                r"^\|.*\|$",
+                conteudo,
+                re.MULTILINE
+            )
+        ) > 1
     )
 
     return texto, titulo, imagens, tem_tabelas
 
 
+# ==========================================================
+# 13. PÁGINA INICIAL
+# ==========================================================
+
 @app.get("/")
 def inicio():
+
     return render_template("index.html")
 
 
+# ==========================================================
+# 14. VERIFICAÇÃO DO SERVIDOR
+# ==========================================================
+
 @app.get("/health")
 def health():
+
     return jsonify({
         "status": "ok",
         "version": "2.0"
     })
 
 
+# ==========================================================
+# 15. API DE EXTRAÇÃO
+# ==========================================================
+
 @app.post("/api/extrair")
 def api_extrair():
+
     dados = request.get_json(silent=True) or {}
+
     url = dados.get("url", "")
 
     try:
+
         url = validate_public_url(url)
+
         metodo = "Trafilatura"
 
         try:
-            texto, titulo, imagens, tabelas, final_url = (
-                extrair_com_trafilatura(url)
-            )
+
+            (
+                texto,
+                titulo,
+                imagens,
+                tabelas,
+                final_url
+            ) = extrair_com_trafilatura(url)
 
         except Exception:
+
+            # Se a extração principal falhar,
+            # tenta utilizar o Jina Reader.
+
             metodo = "Jina Reader"
 
-            texto, titulo, imagens, tem_tabelas = (
-                extrair_com_jina(url)
-            )
+            (
+                texto,
+                titulo,
+                imagens,
+                tem_tabelas
+            ) = extrair_com_jina(url)
 
             tabelas = int(bool(tem_tabelas))
+
             final_url = url
 
+        # Verifica se o conteúdo extraído é suficiente.
+
         if not texto or len(texto.strip()) < 40:
+
             return jsonify({
                 "error": (
                     "A página não forneceu texto suficiente. "
@@ -459,28 +901,47 @@ def api_extrair():
                 )
             }), 422
 
+        # Verifica se o conteúdo ultrapassou o limite.
+
         truncado = len(texto) > MAX_TEXT_LENGTH
+
         texto = texto[:MAX_TEXT_LENGTH]
 
         return jsonify({
+
             "text": texto,
+
             "title": titulo,
+
             "method": metodo,
+
             "truncated": truncado,
+
             "images": imagens,
+
             "table_count": tabelas,
-            "source_url": final_url,
+
+            "source_url": final_url
+
         })
 
     except ValueError as erro:
-        return jsonify({"error": str(erro)}), 400
+
+        return jsonify({
+            "error": str(erro)
+        }), 400
 
     except requests.Timeout:
+
         return jsonify({
-            "error": "A página demorou demais para responder. Tente novamente."
+            "error": (
+                "A página demorou demais para responder. "
+                "Tente novamente."
+            )
         }), 504
 
     except requests.RequestException:
+
         return jsonify({
             "error": (
                 "Não foi possível acessar a página. "
@@ -489,14 +950,24 @@ def api_extrair():
         }), 502
 
     except Exception:
-        app.logger.exception("Erro inesperado na extração")
+
+        app.logger.exception(
+            "Erro inesperado na extração"
+        )
 
         return jsonify({
-            "error": "Ocorreu um erro inesperado durante a extração."
+            "error": (
+                "Ocorreu um erro inesperado durante a extração."
+            )
         }), 500
 
 
+# ==========================================================
+# 16. EXECUÇÃO LOCAL
+# ==========================================================
+
 if __name__ == "__main__":
+
     app.run(
         host="0.0.0.0",
         port=5000,
