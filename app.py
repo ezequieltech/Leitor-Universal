@@ -46,6 +46,9 @@ def validate_public_url(value):
             port or (443 if parsed.scheme == "https" else 80)
         )
 
+        if not addresses:
+            return False
+
         for item in addresses:
             ip = ipaddress.ip_address(item[4][0])
 
@@ -59,32 +62,77 @@ def validate_public_url(value):
 
 
 def limpar_texto(texto):
-    # Remove links vazios
-    texto = re.sub(r'\[\]\[\d+\]', '', texto)
+    """Limpa elementos desnecessários e organiza o texto extraído."""
 
-    # Remove links de navegação sem conteúdo
-    texto = re.sub(r'\[\s*\]\([^)]+\)', '', texto)
-
-    # Remove controles de acessibilidade extraídos da página
-    texto = re.sub(r'(?m)^\s*(A\+|A-)\s*$', '', texto)
-
-    # Remove indicações de publicidade
+    # Remove cabeçalho técnico do Jina Reader
     texto = re.sub(
-        r'(?im)^\s*(Anuncie\s+\[?aqui\]?.*|publicidade)\s*$',
+        r'(?im)^\s*(Title|URL Source|Published Time|Markdown Content):.*$',
         '',
         texto
     )
 
-    # Remove vídeos vazios
-    texto = re.sub(r'<video[^>]*>.*?</video>', '', texto,
-                   flags=re.DOTALL | re.IGNORECASE)
+    # Remove referências vazias
+    texto = re.sub(r'\[\]\[\d+\]', '', texto)
+    texto = re.sub(r'\[\s*\]\([^)]+\)', '', texto)
 
-    # Corrige espaços e quebras excessivas
+    # Remove elementos de navegação e interface
+    texto = re.sub(
+        r'(?im)^\s*(A\+|A-|Seja premium|Copiar)\s*$',
+        '',
+        texto
+    )
+
+    # Remove publicidade
+    texto = re.sub(
+        r'(?im)^\s*Anuncie\s+(?:\[?aqui\]?).*$',
+        '',
+        texto
+    )
+    texto = re.sub(r'(?im)^\s*publicidade\s*$', '', texto)
+
+    # Remove vídeos vazios
+    texto = re.sub(
+        r'<video[^>]*>\s*</video>',
+        '',
+        texto,
+        flags=re.IGNORECASE
+    )
+
+    # Remove lista de artigos relacionados
+    texto = re.sub(
+        r'(?ims)^#{1,6}\s*Artigos de .*$',
+        '',
+        texto
+    )
+
+    # Remove bloco final de referências numéricas
+    texto = re.sub(
+        r'(?m)^\[\d+\]:\s*https?://.*(?:\n|$)',
+        '',
+        texto
+    )
+
+    # Preserva o texto dos links e remove seus endereços
+    texto = re.sub(
+        r'\[([^\]]+)\]\([^)]+\)',
+        r'\1',
+        texto
+    )
+
+    # Remove marcações Markdown de formatação
+    texto = texto.replace('**', '')
+    texto = texto.replace('__', '')
+    texto = texto.replace('*', '')
+    texto = texto.replace('_', '')
+
+    # Corrige espaços e quebras de linha
+    texto = texto.replace('\xa0', ' ')
     texto = re.sub(r'[ \t]+', ' ', texto)
     texto = re.sub(r' *\n *', '\n', texto)
     texto = re.sub(r'\n{3,}', '\n\n', texto)
 
     return texto.strip()
+
 
 @app.get("/")
 def index():
@@ -99,7 +147,10 @@ def extract_text():
 
     if not validate_public_url(url):
         return jsonify({
-            "error": "Informe um endereço público válido começando com http:// ou https://."
+            "error": (
+                "Informe um endereço público válido "
+                "começando com http:// ou https://."
+            )
         }), 400
 
     try:
@@ -127,11 +178,9 @@ def extract_text():
         response.raise_for_status()
 
         content = response.text[:MAX_TEXT_LENGTH]
-        content = limpar_texto(content)
 
-        content = content.replace("\xa0", " ")
-        content = re.sub(r"\n{3,}", "\n\n", content)
-        content = content.strip()
+        # Limpa e organiza o texto extraído
+        content = limpar_texto(content)
 
         if not content:
             return jsonify({
@@ -159,4 +208,8 @@ def health():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        debug=False
+    )
