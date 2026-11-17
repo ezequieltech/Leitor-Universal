@@ -17,7 +17,6 @@ app = Flask(__name__)
 MAX_TEXT_LENGTH = 60000
 TIMEOUT_SECONDS = 35
 
-# Processador de Markdown
 markdown = MarkdownIt("commonmark")
 
 
@@ -70,7 +69,7 @@ def validate_public_url(value):
 
 
 def remover_elementos_desnecessarios(texto):
-    """Remove metadados, publicidade e referências técnicas."""
+    """Remove elementos técnicos e publicidade."""
 
     # Remove cabeçalho técnico do Jina Reader
     texto = re.sub(
@@ -79,13 +78,14 @@ def remover_elementos_desnecessarios(texto):
         texto
     )
 
-    # Remove publicidade e elementos de interface
+    # Remove controles e elementos de interface
     texto = re.sub(
         r'(?im)^\s*(Seja premium|A\+|A-|Copiar|publicidade)\s*$',
         '',
         texto
     )
 
+    # Remove publicidade
     texto = re.sub(
         r'(?im)^\s*Anuncie\s+(?:\[?aqui\]?).*$',
         '',
@@ -100,7 +100,7 @@ def remover_elementos_desnecessarios(texto):
         flags=re.IGNORECASE
     )
 
-    # Remove lista de artigos relacionados no final
+    # Remove artigos relacionados no final
     texto = re.sub(
         r'(?ims)^#{1,6}\s*Artigos de .*$',
         '',
@@ -118,7 +118,7 @@ def remover_elementos_desnecessarios(texto):
 
 
 def extrair_texto_html(html):
-    """Converte o HTML em texto organizado para leitura."""
+    """Converte HTML em texto organizado."""
 
     soup = BeautifulSoup(html, "html.parser")
 
@@ -170,7 +170,6 @@ def extrair_texto_html(html):
             partes.append("\n")
 
         elif nome in tags_com_separacao:
-            # Evita juntar palavras de elementos formatados
             partes.append(" ")
 
         for filho in elemento.children:
@@ -189,11 +188,8 @@ def extrair_texto_html(html):
     # Normaliza espaços
     texto = re.sub(r'[ \t]+', ' ', texto)
 
-    # Remove espaços antes de pontuação
+    # Corrige espaços antes de pontuação
     texto = re.sub(r'\s+([,.;:!?%)\]])', r'\1', texto)
-
-    # Remove espaços depois de sinais de abertura
-    texto = re.sub(r'([(])\s+', r'\1', texto)
 
     # Organiza parágrafos
     texto = re.sub(r' *\n *', '\n', texto)
@@ -203,22 +199,76 @@ def extrair_texto_html(html):
 
 
 def limpar_texto(texto):
-    """Processa Markdown e organiza o conteúdo para leitura por voz."""
+    """Limpa Markdown e organiza o conteúdo para leitura por voz."""
 
     texto = remover_elementos_desnecessarios(texto)
+
+    # Remove referências vazias
+    texto = re.sub(r'\[\]\[\d+\]', '', texto)
+
+    # Remove links de navegação conhecidos
+    texto = re.sub(
+        r'(?im)^\s*\[(?:Home|História do Brasil)\](?:\[\d+\])?\s*$',
+        '',
+        texto
+    )
+
+    # Preserva o texto dos links e remove a referência numérica
+    texto = re.sub(
+        r'\[([^\]]+)\]\[\d+\]',
+        r'\1',
+        texto
+    )
+
+    # Remove referências vazias restantes
+    texto = re.sub(r'\[\s*\]\[\d+\]', '', texto)
 
     # Converte Markdown em HTML
     html = markdown.render(texto)
 
-    # Converte o HTML em texto simples organizado
+    # Converte HTML em texto organizado
     texto = extrair_texto_html(html)
 
-    # Limpeza final
-    texto = texto.replace("\xa0", " ")
+    # Remove marcações Markdown que eventualmente sobraram
+    texto = re.sub(r'\*+', '', texto)
+    texto = re.sub(r'(?<!\w)_|_(?!\w)', '', texto)
+
+    # Remove referências numéricas isoladas
+    texto = re.sub(r'\[\d+\]', '', texto)
+
+    # Corrige espaços antes de pontuação
+    texto = re.sub(r'\s+([,.;:!?%)\]])', r'\1', texto)
+
+    # Garante espaço depois de pontuação quando necessário
+    texto = re.sub(
+        r'([.!?])(?=[A-ZÁÉÍÓÚÂÊÔÃÕÇ])',
+        r'\1 ',
+        texto
+    )
+
+    # Normaliza espaços
+    texto = texto.replace('\xa0', ' ')
     texto = re.sub(r'[ \t]+', ' ', texto)
+    texto = re.sub(r' *\n *', '\n', texto)
     texto = re.sub(r'\n{3,}', '\n\n', texto)
 
-    return texto.strip()
+    # Remove linhas consecutivas duplicadas
+    linhas = texto.splitlines()
+    resultado = []
+
+    for linha in linhas:
+        linha_limpa = linha.strip()
+
+        if (
+            linha_limpa
+            and resultado
+            and resultado[-1].strip().casefold() == linha_limpa.casefold()
+        ):
+            continue
+
+        resultado.append(linha)
+
+    return '\n'.join(resultado).strip()
 
 
 @app.get("/")
@@ -264,7 +314,7 @@ def extract_text():
 
         response.raise_for_status()
 
-        # Limita o tamanho do conteúdo recebido
+        # Limita o tamanho do conteúdo
         texto_original = response.text[:MAX_TEXT_LENGTH]
 
         # Limpa e organiza o conteúdo
