@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Leitor Universal: leitura de textos em voz alta e recursos de acessibilidade.">
+  <title>Leitor Universal</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <main class="container">
+    <header>
+      <p class="eyebrow">ACESSIBILIDADE DIGITAL</p>
+      <h1>Leitor Universal</h1>
+      <p class="intro">Ouça textos digitados ou extraídos de páginas da internet.</p>
+    </header>
+
+    <section class="panel" aria-labelledby="url-heading">
+      <h2 id="url-heading">Ler uma página da internet</h2>
+      <label for="urlEntrada">Endereço da página</label>
+      <div class="url-row">
+        <input id="urlEntrada" type="url" placeholder="https://exemplo.com/artigo" autocomplete="url">
+        <button id="extrairBtn" type="button">Extrair texto</button>
+      </div>
+      <p class="hint">Algumas páginas protegidas, com login ou que bloqueiam extração podem não funcionar.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Texto para leitura</h2>
+      <label for="textoEntrada">Digite, cole ou revise o texto extraído</label>
+      <textarea id="textoEntrada" rows="11" placeholder="Digite ou cole seu texto aqui..."></textarea>
+      <div class="actions">
+        <button id="ouvirBtn" type="button">Ouvir</button>
+        <button id="pausarBtn" class="secondary" type="button">Pausar</button>
+        <button id="pararBtn" class="secondary" type="button">Parar</button>
+        <button id="limparBtn" class="secondary" type="button">Limpar</button>
+      </div>
+      <p id="status" class="status" role="status" aria-live="polite">Pronto para leitura.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Configurações de leitura</h2>
+      <div class="settings-grid">
+        <div>
+          <label for="voz">Voz</label>
+          <select id="voz"><option value="">Voz padrão do dispositivo</option></select>
+        </div>
+        <div>
+          <label for="velocidade">Velocidade: <output id="velocidadeValor">1.0</output></label>
+          <input id="velocidade" type="range" min="0.5" max="2" step="0.1" value="1">
+        </div>
+        <div>
+          <label for="tom">Tom: <output id="tomValor">1.0</output></label>
+          <input id="tom" type="range" min="0.5" max="2" step="0.1" value="1">
+        </div>
+        <div>
+          <label for="tamanho">Tamanho do texto: <output id="tamanhoValor">18</output> px</label>
+          <input id="tamanho" type="range" min="14" max="30" step="1" value="18">
+        </div>
+        <div>
+          <label for="espacamento">Espaçamento entre linhas</label>
+          <select id="espacamento">
+            <option value="1.4">Normal</option>
+            <option value="1.8" selected>Amplo</option>
+            <option value="2.2">Muito amplo</option>
+          </select>
+        </div>
+      </div>
+      <div class="checks">
+        <label><input type="checkbox" id="altoContraste"> Alto contraste</label>
+        <label><input type="checkbox" id="fonteLegivel"> Fonte de leitura</label>
+      </div>
+    </section>
+
+    <footer>Leitor Universal — projeto de acessibilidade digital.</footer>
+  </main>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
