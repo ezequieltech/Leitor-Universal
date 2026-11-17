@@ -1,74 +1,70 @@
 import ipaddress
-import socket
 import re
-from urllib.parse import urlparse, urljoin
+import socket
+from urllib.parse import urljoin, urlparse
 
 import requests
 import trafilatura
-
+from bs4 import BeautifulSoup, NavigableString, Tag
 from flask import Flask, jsonify, render_template, request
 from markdown_it import MarkdownIt
-from bs4 import BeautifulSoup, NavigableString, Tag
 
 app = Flask(__name__)
-
 MAX_TEXT_LENGTH = 60000
+MAX_IMAGES = 30
 TIMEOUT_SECONDS = 35
 MAX_REDIRECTS = 5
-
-# O preset default inclui suporte a tabelas Markdown.
 markdown = MarkdownIt("default")
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; LeitorUniversal/2.0; +https://github.com/ezequieltech/Leitor-Universal)"
+}
 
 
 def validate_public_url(value):
-    """Aceita somente URLs HTTP/HTTPS com destino público."""
+    """Aceita apenas URLs HTTP(S) públicas."""
     if not isinstance(value, str) or len(value) > 2048:
-        return False
+        raise ValueError("Informe um endereço válido.")
 
     parsed = urlparse(value.strip())
+
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        return False
+        raise ValueError("Use um endereço iniciado por http:// ou https://.")
+
     if parsed.username or parsed.password:
-        return False
+        raise ValueError("Endereços com usuário ou senha não são aceitos.")
 
-    try:
-        port = parsed.port
-    except ValueError:
-        return False
+    if parsed.port and parsed.port not in (80, 443):
+        raise ValueError("Por segurança, somente as portas 80 e 443 são aceitas.")
 
-    if port not in (None, 80, 443):
-        return False
+    host = parsed.hostname.rstrip(".").lower()
 
-    host = parsed.hostname
-    if host.lower() == "localhost":
-        return False
+    if host in ("localhost",) or host.endswith(".localhost") or host.endswith(".local"):
+        raise ValueError("Endereços locais não são aceitos.")
 
     try:
         addresses = socket.getaddrinfo(
-            host, port or (443 if parsed.scheme == "https" else 80)
+            host,
+            parsed.port or (443 if parsed.scheme == "https" else 80)
         )
-        if not addresses:
-            return False
-        for item in addresses:
-            ip = ipaddress.ip_address(item[4][0])
-            if not ip.is_global:
-                return False
-    except (socket.gaierror, ValueError):
-        return False
+    except socket.gaierror:
+        raise ValueError("Não foi possível localizar esse endereço na internet.")
 
-    return True
+    for item in addresses:
+        ip = ipaddress.ip_address(item[4][0])
+        if not ip.is_global:
+            raise ValueError("O endereço informado não é público.")
+
+    return value.strip()
 
 
-def get_with_safe_redirects(url, headers, timeout=TIMEOUT_SECONDS):
-    """Segue redirecionamentos manualmente, validando cada destino."""
-    current = url
+def get_with_safe_redirects(url, headers=None, timeout=TIMEOUT_SECONDS):
+    current = validate_public_url(url)
+
     for _ in range(MAX_REDIRECTS + 1):
-        if not validate_public_url(current):
-            raise ValueError("O endereço ou redirecionamento não é público.")
-
         response = requests.get(
             current,
-            headers=headers,
+            headers=headers or HEADERS,
             timeout=timeout,
             allow_redirects=False,
         )
@@ -78,306 +74,431 @@ def get_with_safe_redirects(url, headers, timeout=TIMEOUT_SECONDS):
             return response
 
         location = response.headers.get("Location")
-        response.close()
-        if not location:
-            raise requests.RequestException("Redirecionamento sem destino.")
-        current = urljoin(current, location)
 
-    raise requests.RequestException("A página excedeu o limite de redirecionamentos.")
+        if not location:
+            response.raise_for_status()
+
+        current = validate_public_url(urljoin(current, location))
+
+    raise ValueError("A página apresentou redirecionamentos demais.")
+
+
+def escolher_area_principal(soup):
+    candidatos = []
+
+    for seletor in ("article", "main", '[role="main"]'):
+        candidatos.extend(soup.select(seletor))
+
+    if candidatos:
+        return max(
+            candidatos,
+            key=lambda el: len(el.get_text(" ", strip=True))
+        )
+
+    return soup.body or soup
+
+
+def extrair_imagens(area, base_url):
+    imagens = []
+    vistos = set()
+
+    for img in area.find_all("img"):
+        src = (
+            img.get("src")
+            or img.get("data-src")
+            or img.get("data-original")
+        )
+
+        if not src and img.get("srcset"):
+            src = img.get("srcset").split(",")[0].strip().split(" ")[0]
+
+        alt = (img.get("alt") or "").strip()
+        title = (img.get("title") or "").strip()
+
+        figure = img.find_parent("figure")
+        legenda = ""
+
+        if figure:
+            cap = figure.find("figcaption")
+            if cap:
+                legenda = cap.get_text(" ", strip=True)
+
+        descricao = legenda or alt or title
+
+        if not descricao:
+            continue
+
+        imagem_url = urljoin(base_url, src) if src else ""
+        parsed = urlparse(imagem_url)
+
+        if imagem_url and (
+            parsed.scheme not in ("http", "https")
+            or not parsed.hostname
+        ):
+            imagem_url = ""
+
+        chave = (descricao, imagem_url)
+
+        if chave in vistos:
+            continue
+
+        vistos.add(chave)
+
+        imagens.append({
+            "description": descricao[:500],
+            "alt": alt[:300],
+            "caption": legenda[:500],
+        })
+
+        if len(imagens) >= MAX_IMAGES:
+            break
+
+    return imagens
 
 
 def texto_de_elemento(elemento):
-    """Converte HTML em texto mantendo blocos, listas e linhas de tabelas."""
     partes = []
 
-    def texto_inline(no):
-        if isinstance(no, NavigableString):
-            return str(no)
-        if not isinstance(no, Tag):
-            return ""
-        if no.name == "br":
-            return "\n"
-        if no.name in ("script", "style", "noscript", "svg"):
-            return ""
-        return "".join(texto_inline(filho) for filho in no.children)
-
-    def percorrer(no):
+    def visitar(no):
         if isinstance(no, NavigableString):
             valor = str(no).strip()
+
             if valor:
                 partes.append(valor)
+
             return
+
         if not isinstance(no, Tag):
             return
 
-        nome = (no.name or "").lower()
-        if nome in ("script", "style", "noscript", "svg", "iframe",
-                    "video", "audio", "nav", "footer", "aside", "form"):
-            return
+        nome = no.name.lower()
+        classes = " ".join(no.get("class", [])).lower()
+        role = (no.get("role") or "").lower()
 
-        classes = " ".join(no.get("class", [])).casefold()
-        role = (no.get("role") or "").casefold()
-        if role in ("navigation", "banner", "contentinfo") or any(
-            termo in classes for termo in (
-                "advert", "ads", "sidebar", "cookie", "newsletter",
-                "social-share", "related", "comments", "breadcrumb"
-            )
+        descartados = {
+            "script", "style", "noscript", "svg", "iframe",
+            "video", "audio", "nav", "footer", "aside",
+            "form", "button"
+        }
+
+        termos_ruins = (
+            "advert", "ads", "sidebar", "cookie", "newsletter",
+            "social-share", "related", "comments", "breadcrumb",
+            "menu", "share"
+        )
+
+        if nome in descartados or role in (
+            "navigation", "banner", "contentinfo"
         ):
             return
 
+        if any(t in classes for t in termos_ruins):
+            return
+
+        if nome == "img":
+            alt = (no.get("alt") or "").strip()
+
+            if alt:
+                partes.append(f"Imagem: {alt}")
+
+            return
+
         if nome in ("h1", "h2", "h3", "h4", "h5", "h6"):
-            valor = texto_inline(no).strip()
-            if valor:
-                partes.extend(["\n\n", valor, "\n"])
-            return
-
-        if nome == "p":
-            valor = texto_inline(no).strip()
-            if valor:
-                partes.extend(["\n\n", valor, "\n"])
-            return
-
-        if nome in ("ul", "ol"):
-            contador = 0
-            for item in no.find_all("li", recursive=False):
-                contador += 1
-                marcador = f"{contador}. " if nome == "ol" else "• "
-                valor = texto_inline(item).strip()
-                if valor:
-                    partes.extend(["\n", marcador, valor])
             partes.append("\n")
-            return
 
-        if nome == "li":
-            valor = texto_inline(no).strip()
-            if valor:
-                partes.extend(["\n• ", valor])
-            return
-
-        if nome == "table":
-            for linha in no.find_all("tr"):
-                celulas = linha.find_all(["th", "td"], recursive=False)
-                valores = [texto_inline(c).strip() for c in celulas]
-                valores = [v for v in valores if v]
-                if valores:
-                    partes.extend(["\n", " | ".join(valores)])
-            partes.append("\n")
-            return
-
-        if nome in ("div", "section", "article", "main", "blockquote"):
-            partes.append("\n")
             for filho in no.children:
-                percorrer(filho)
+                visitar(filho)
+
+            partes.append("\n")
+            return
+
+        if nome in (
+            "p", "li", "tr", "blockquote", "figcaption"
+        ):
+            partes.append("\n")
+
+            for filho in no.children:
+                visitar(filho)
+
+            partes.append("\n")
+            return
+
+        if nome in ("td", "th"):
+            partes.append(" | ")
+
+            for filho in no.children:
+                visitar(filho)
+
+            partes.append(" ")
+            return
+
+        if nome == "br":
+            partes.append("\n")
+            return
+
+        if nome in (
+            "ul", "ol", "table", "thead", "tbody", "tfoot"
+        ):
+            partes.append("\n")
+
+            for filho in no.children:
+                visitar(filho)
+
             partes.append("\n")
             return
 
         for filho in no.children:
-            percorrer(filho)
+            visitar(filho)
 
-    percorrer(elemento)
-    texto = "".join(partes)
-    texto = re.sub(r"[ \t]+", " ", texto)
-    texto = re.sub(r" *\n *", "\n", texto)
-    texto = re.sub(r"\n{3,}", "\n\n", texto)
-    return texto.strip()
+    visitar(elemento)
+
+    return "\n".join(partes)
 
 
 def markdown_para_texto(conteudo):
-    """Converte Markdown em texto preservando títulos, listas e tabelas."""
-    html = markdown.render(conteudo)
+    html = markdown.render(conteudo or "")
     soup = BeautifulSoup(html, "html.parser")
+
     return texto_de_elemento(soup)
 
 
 def limpar_linhas(texto):
-    """Remove ruídos recorrentes sem apagar títulos legítimos."""
-    remover_exato = {
-        "seja premium", "home", "boa leitura!",
-        "deseja fazer uma citação?", "pular para o conteúdo",
-        "ir para o conteúdo", "menu", "buscar"
-    }
+    linhas = []
 
-    resultado = []
-    for linha in texto.splitlines():
-        limpa = linha.strip()
-        if not limpa:
-            if resultado and resultado[-1] != "":
-                resultado.append("")
-            continue
-        if limpa.casefold() in remover_exato:
+    for linha in (texto or "").splitlines():
+        linha = re.sub(r"[ \t]+", " ", linha).strip()
+
+        if not linha:
+            if linhas and linhas[-1] != "":
+                linhas.append("")
             continue
 
-        # Algumas páginas do Gov.br entregam o menu inteiro como um único bloco.
-        if (
-            len(limpa) > 180
-            and "gov br" in limpa.casefold()
-            and "ministério" in limpa.casefold()
-            and "planalto" in limpa.casefold()
-            and "ir para o conteúdo" in limpa.casefold()
+        baixa = linha.lower()
+
+        if baixa in {
+            "ir para o conteúdo",
+            "ir para o menu",
+            "ir para a busca",
+            "pular para o conteúdo",
+            "menu principal",
+            "fim do conteúdo"
+        }:
+            continue
+
+        if len(linha) > 500 and all(
+            p in baixa for p in ("gov br", "ministério", "ir para")
         ):
             continue
 
-        if resultado and resultado[-1].casefold() == limpa.casefold():
-            continue
-        resultado.append(limpa)
+        linhas.append(linha)
 
-    return "\n".join(resultado).strip()
+    return "\n".join(linhas).strip()
 
 
 def corrigir_separacoes(texto):
-    """Corrige espaçamentos comuns sem alterar números inteiros."""
     texto = re.sub(
-        r'(?<=[a-záéíóúâêôãõç])(?=[A-ZÁÉÍÓÚÂÊÔÃÕÇ])',
-        ' ',
+        r"(?<=[.!?])(?=[A-ZÁÉÍÓÚÂÊÔÃÕÇ])",
+        " ",
         texto
     )
-    texto = re.sub(r'(\]\[\d+\])(?=\[)', r'\1 ', texto)
-    texto = re.sub(r'\s+([,.;:!?%)\]])', r'\1', texto)
-    texto = re.sub(r',(?=\S)', ', ', texto)
 
-    # Corrige decimais separados indevidamente: 0, 52%, 6, 4 °C,
-    # 1, 428 bilhão. A regra exige unidade/escala após o segundo grupo.
-    texto = re.sub(
-        r'(\d),\s+(\d{1,3})(?=\s*(?:%|°|bilh(?:ão|ões)?|milh(?:ão|ões)?|'
-        r'mil\b|habitantes|metros|centímetros|mm\b|cm\b|km\b|kg\b|°C))',
-        r'\1,\2',
-        texto,
-        flags=re.IGNORECASE
-    )
+    texto = re.sub(r"(?<=\d),\s+(?=\d)", ",", texto)
+    texto = re.sub(r"(?<=\d)\s+%", "%", texto)
+    texto = re.sub(r"[ \t]{2,}", " ", texto)
 
-    texto = re.sub(
-        r'(?i)Escrito por(?=[A-ZÁÉÍÓÚÂÊÔÃÕÇ])',
-        'Escrito por ',
-        texto
-    )
-    texto = re.sub(r'[ \t]+', ' ', texto)
-    texto = re.sub(r' *\n *', '\n', texto)
-    texto = re.sub(r'\n{3,}', '\n\n', texto)
+    return texto
+
+
+def limpar_texto(texto):
+    texto = (texto or "").replace("\u00ad", "")
+    texto = corrigir_separacoes(texto)
+    texto = limpar_linhas(texto)
+    texto = re.sub(r"\n{3,}", "\n\n", texto)
+
     return texto.strip()
 
 
 def extrair_com_trafilatura(url):
-    """Primeira tentativa: extração principal com estrutura em Markdown."""
-    resposta = get_with_safe_redirects(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; LeitorUniversal/3.0)"}
+    resposta = get_with_safe_redirects(url)
+    html = resposta.text
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    titulo = (
+        soup.title.get_text(" ", strip=True)
+        if soup.title else ""
     )
-    texto = trafilatura.extract(
-        resposta.text,
+
+    area = escolher_area_principal(soup)
+    imagens = extrair_imagens(area, resposta.url)
+
+    for no in area.select(
+        "script,style,noscript,nav,footer,aside,form,iframe,video,audio"
+    ):
+        no.decompose()
+
+    extraido = trafilatura.extract(
+        str(area),
         output_format="markdown",
-        include_comments=False,
         include_tables=True,
         include_links=False,
         favor_precision=True,
+        deduplicate=True,
     )
-    if not texto:
-        return None
-    return markdown_para_texto(texto)
+
+    if not extraido or len(extraido.strip()) < 80:
+        extraido = texto_de_elemento(area)
+
+    texto = limpar_texto(markdown_para_texto(extraido))
+    table_count = len(area.find_all("table"))
+
+    return texto, titulo, imagens, table_count, resposta.url
+
+
+def extrair_imagens_markdown(conteudo):
+    imagens = []
+
+    for alt in re.findall(r"!\[([^\]]*)\]\([^)]+\)", conteudo or ""):
+        alt = alt.strip()
+
+        if alt:
+            imagens.append({
+                "description": alt[:500],
+                "alt": alt[:300],
+                "caption": ""
+            })
+
+        if len(imagens) >= MAX_IMAGES:
+            break
+
+    return imagens
 
 
 def extrair_com_jina(url):
-    """Segunda tentativa: Jina Reader, mantendo a estrutura do Markdown."""
+    url_validada = validate_public_url(url)
+
     resposta = requests.get(
-        "https://r.jina.ai/" + url,
+        "https://r.jina.ai/" + url_validada,
         headers={
-            "Accept": "text/plain",
-            "User-Agent": "LeitorUniversal/3.0",
-            "X-Respond-With": "markdown",
-            "X-Preset": "reader",
-            "X-Remove-Selector": (
-                "nav, footer, aside, form, header, "
-                "[role='navigation'], [role='banner'], "
-                "[role='contentinfo'], .advertisement, .ads, "
-                ".sidebar, .cookie, .newsletter, .social-share, "
-                ".related, .comments, .breadcrumb"
-            ),
-            "X-Retain-Images": "none",
+            "User-Agent": HEADERS["User-Agent"],
+            "X-Return-Format": "markdown",
+            "X-Remove-Selector": "nav,footer,aside,form",
+            "X-Retain-Images": "all",
         },
-        timeout=TIMEOUT_SECONDS,
+        timeout=TIMEOUT_SECONDS + 10,
         allow_redirects=False,
     )
+
     resposta.raise_for_status()
-    conteudo = resposta.text[:MAX_TEXT_LENGTH]
 
-    conteudo = re.sub(
-        r'(?im)^\s*(Title|URL Source|Published Time|Markdown Content):.*$',
-        '',
-        conteudo
+    conteudo = resposta.text
+
+    titulo_match = re.search(
+        r"^Title:\s*(.+)$",
+        conteudo,
+        re.MULTILINE
     )
-    return markdown_para_texto(conteudo)
 
+    titulo = (
+        titulo_match.group(1).strip()
+        if titulo_match else ""
+    )
 
-def limpar_texto(texto):
-    if not texto:
-        return ""
-    texto = corrigir_separacoes(texto)
-    texto = limpar_linhas(texto)
-    texto = re.sub(r'\[\d+\]', '', texto)
-    texto = re.sub(r'[ \t]+', ' ', texto)
-    texto = re.sub(r'\n{3,}', '\n\n', texto)
-    return texto.strip()
+    imagens = extrair_imagens_markdown(conteudo)
+    texto = limpar_texto(markdown_para_texto(conteudo))
+
+    tem_tabelas = (
+        len(re.findall(r"^\|.*\|$", conteudo, re.MULTILINE)) > 1
+    )
+
+    return texto, titulo, imagens, tem_tabelas
 
 
 @app.get("/")
-def index():
+def inicio():
     return render_template("index.html")
-
-
-@app.post("/api/extrair")
-def extract_text():
-    data = request.get_json(silent=True) or {}
-    url = (data.get("url") or "").strip()
-
-    if not validate_public_url(url):
-        return jsonify({
-            "error": "Informe um endereço público válido começando com http:// ou https://."
-        }), 400
-
-    texto = None
-    metodo = None
-
-    try:
-        texto = extrair_com_trafilatura(url)
-        if texto and texto.strip():
-            metodo = "trafilatura"
-    except Exception:
-        texto = None
-
-    if not texto or not texto.strip():
-        try:
-            texto = extrair_com_jina(url)
-            if texto and texto.strip():
-                metodo = "jina"
-        except Exception:
-            texto = None
-
-    if not texto or not texto.strip():
-        return jsonify({
-            "error": (
-                "Não foi possível extrair essa página. Ela pode bloquear "
-                "a leitura automática ou estar indisponível. "
-                "Você pode copiar o texto e colar na caixa abaixo."
-            )
-        }), 502
-
-    texto = limpar_texto(texto)
-    truncado = len(texto) > MAX_TEXT_LENGTH
-    texto = texto[:MAX_TEXT_LENGTH]
-
-    if not texto:
-        return jsonify({"error": "Não foi possível encontrar texto nessa página."}), 422
-
-    return jsonify({
-        "text": texto,
-        "method": metodo,
-        "truncated": truncado,
-    })
 
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({
+        "status": "ok",
+        "version": "2.0"
+    })
+
+
+@app.post("/api/extrair")
+def api_extrair():
+    dados = request.get_json(silent=True) or {}
+    url = dados.get("url", "")
+
+    try:
+        url = validate_public_url(url)
+        metodo = "Trafilatura"
+
+        try:
+            texto, titulo, imagens, tabelas, final_url = (
+                extrair_com_trafilatura(url)
+            )
+
+        except Exception:
+            metodo = "Jina Reader"
+
+            texto, titulo, imagens, tem_tabelas = (
+                extrair_com_jina(url)
+            )
+
+            tabelas = int(bool(tem_tabelas))
+            final_url = url
+
+        if not texto or len(texto.strip()) < 40:
+            return jsonify({
+                "error": (
+                    "A página não forneceu texto suficiente. "
+                    "Tente outra página ou cole o texto manualmente."
+                )
+            }), 422
+
+        truncado = len(texto) > MAX_TEXT_LENGTH
+        texto = texto[:MAX_TEXT_LENGTH]
+
+        return jsonify({
+            "text": texto,
+            "title": titulo,
+            "method": metodo,
+            "truncated": truncado,
+            "images": imagens,
+            "table_count": tabelas,
+            "source_url": final_url,
+        })
+
+    except ValueError as erro:
+        return jsonify({"error": str(erro)}), 400
+
+    except requests.Timeout:
+        return jsonify({
+            "error": "A página demorou demais para responder. Tente novamente."
+        }), 504
+
+    except requests.RequestException:
+        return jsonify({
+            "error": (
+                "Não foi possível acessar a página. "
+                "Ela pode estar protegida ou indisponível."
+            )
+        }), 502
+
+    except Exception:
+        app.logger.exception("Erro inesperado na extração")
+
+        return jsonify({
+            "error": "Ocorreu um erro inesperado durante a extração."
+        }), 500
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        debug=False
+    )

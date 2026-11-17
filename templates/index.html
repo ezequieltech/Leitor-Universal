@@ -22,11 +22,11 @@
         <input id="urlEntrada" type="url" placeholder="https://exemplo.com/artigo" autocomplete="url">
         <button id="extrairBtn" type="button">Extrair texto</button>
       </div>
-      <p class="hint">Algumas páginas protegidas, com login ou que bloqueiam extração podem não funcionar.</p>
+      <p class="hint">Páginas protegidas, com login ou que bloqueiam extração podem não funcionar.</p>
     </section>
 
-    <section class="panel">
-      <h2>Texto para leitura</h2>
+    <section class="panel" aria-labelledby="texto-heading">
+      <h2 id="texto-heading">Texto para leitura</h2>
       <label for="textoEntrada">Digite, cole ou revise o texto extraído</label>
       <textarea id="textoEntrada" rows="11" placeholder="Digite ou cole seu texto aqui..."></textarea>
       <div class="actions">
@@ -38,8 +38,20 @@
       <p id="status" class="status" role="status" aria-live="polite">Pronto para leitura.</p>
     </section>
 
-    <section class="panel">
-      <h2>Configurações de leitura</h2>
+    <section id="resultadoInfo" class="panel result-info" aria-live="polite" hidden>
+      <h2>Informações da extração</h2>
+      <p id="tituloPagina"></p>
+      <p id="detalhesExtracao" class="hint"></p>
+    </section>
+
+    <section id="visuaisSection" class="panel" aria-labelledby="visuais-heading" hidden>
+      <h2 id="visuais-heading">Imagens e legendas identificadas</h2>
+      <p class="hint">O leitor apresenta textos alternativos e legendas encontrados na página. Ele não cria descrições automáticas para imagens sem texto descritivo.</p>
+      <ul id="listaVisuais" class="visual-list"></ul>
+    </section>
+
+    <section class="panel" aria-labelledby="config-heading">
+      <h2 id="config-heading">Configurações de leitura</h2>
       <div class="settings-grid">
         <div>
           <label for="voz">Voz</label>
