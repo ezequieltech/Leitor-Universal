@@ -2,15 +2,23 @@
 import ipaddress
 import socket
 import re
+
 from urllib.parse import urlparse
 
 import requests
+
 from flask import Flask, jsonify, render_template, request
+from markdown_it import MarkdownIt
+from bs4 import BeautifulSoup, NavigableString, Tag
+
 
 app = Flask(__name__)
 
 MAX_TEXT_LENGTH = 60000
 TIMEOUT_SECONDS = 35
+
+# Processador de Markdown
+markdown = MarkdownIt("commonmark")
 
 
 def validate_public_url(value):
@@ -61,8 +69,8 @@ def validate_public_url(value):
     return True
 
 
-def limpar_texto(texto):
-    """Limpa elementos desnecessários e organiza o texto extraído."""
+def remover_elementos_desnecessarios(texto):
+    """Remove metadados, publicidade e referências técnicas."""
 
     # Remove cabeçalho técnico do Jina Reader
     texto = re.sub(
@@ -71,24 +79,18 @@ def limpar_texto(texto):
         texto
     )
 
-    # Remove referências vazias
-    texto = re.sub(r'\[\]\[\d+\]', '', texto)
-    texto = re.sub(r'\[\s*\]\([^)]+\)', '', texto)
-
-    # Remove elementos de navegação e interface
+    # Remove publicidade e elementos de interface
     texto = re.sub(
-        r'(?im)^\s*(A\+|A-|Seja premium|Copiar)\s*$',
+        r'(?im)^\s*(Seja premium|A\+|A-|Copiar|publicidade)\s*$',
         '',
         texto
     )
 
-    # Remove publicidade
     texto = re.sub(
         r'(?im)^\s*Anuncie\s+(?:\[?aqui\]?).*$',
         '',
         texto
     )
-    texto = re.sub(r'(?im)^\s*publicidade\s*$', '', texto)
 
     # Remove vídeos vazios
     texto = re.sub(
@@ -98,37 +100,122 @@ def limpar_texto(texto):
         flags=re.IGNORECASE
     )
 
-    # Remove lista de artigos relacionados
+    # Remove lista de artigos relacionados no final
     texto = re.sub(
         r'(?ims)^#{1,6}\s*Artigos de .*$',
         '',
         texto
     )
 
-    # Remove bloco final de referências numéricas
+    # Remove referências numéricas de links no final
     texto = re.sub(
         r'(?m)^\[\d+\]:\s*https?://.*(?:\n|$)',
         '',
         texto
     )
 
-    # Preserva o texto dos links e remove seus endereços
-    texto = re.sub(
-        r'\[([^\]]+)\]\([^)]+\)',
-        r'\1',
-        texto
-    )
+    return texto.strip()
 
-    # Remove marcações Markdown de formatação
-    texto = texto.replace('**', '')
-    texto = texto.replace('__', '')
-    texto = texto.replace('*', '')
-    texto = texto.replace('_', '')
 
-    # Corrige espaços e quebras de linha
-    texto = texto.replace('\xa0', ' ')
+def extrair_texto_html(html):
+    """Converte o HTML em texto organizado para leitura."""
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Remove elementos que não fazem parte do conteúdo textual
+    for elemento in soup.find_all([
+        "script",
+        "style",
+        "noscript",
+        "svg",
+        "iframe",
+        "video",
+        "audio",
+        "nav",
+        "footer",
+        "aside",
+        "form"
+    ]):
+        elemento.decompose()
+
+    partes = []
+
+    tags_de_bloco = {
+        "address", "article", "blockquote", "div",
+        "h1", "h2", "h3", "h4", "h5", "h6",
+        "li", "main", "ol", "p", "section", "table",
+        "tr", "ul"
+    }
+
+    tags_com_separacao = {
+        "a", "b", "strong", "em", "i", "code"
+    }
+
+    def percorrer(elemento):
+
+        if isinstance(elemento, NavigableString):
+            partes.append(str(elemento))
+            return
+
+        if not isinstance(elemento, Tag):
+            return
+
+        nome = elemento.name.lower()
+
+        if nome == "br":
+            partes.append("\n")
+            return
+
+        if nome in tags_de_bloco:
+            partes.append("\n")
+
+        elif nome in tags_com_separacao:
+            # Evita juntar palavras de elementos formatados
+            partes.append(" ")
+
+        for filho in elemento.children:
+            percorrer(filho)
+
+        if nome in tags_de_bloco:
+            partes.append("\n")
+
+        elif nome in tags_com_separacao:
+            partes.append(" ")
+
+    percorrer(soup)
+
+    texto = "".join(partes)
+
+    # Normaliza espaços
     texto = re.sub(r'[ \t]+', ' ', texto)
+
+    # Remove espaços antes de pontuação
+    texto = re.sub(r'\s+([,.;:!?%)\]])', r'\1', texto)
+
+    # Remove espaços depois de sinais de abertura
+    texto = re.sub(r'([(])\s+', r'\1', texto)
+
+    # Organiza parágrafos
     texto = re.sub(r' *\n *', '\n', texto)
+    texto = re.sub(r'\n{3,}', '\n\n', texto)
+
+    return texto.strip()
+
+
+def limpar_texto(texto):
+    """Processa Markdown e organiza o conteúdo para leitura por voz."""
+
+    texto = remover_elementos_desnecessarios(texto)
+
+    # Converte Markdown em HTML
+    html = markdown.render(texto)
+
+    # Converte o HTML em texto simples organizado
+    texto = extrair_texto_html(html)
+
+    # Limpeza final
+    texto = texto.replace("\xa0", " ")
+    texto = re.sub(r'[ \t]+', ' ', texto)
     texto = re.sub(r'\n{3,}', '\n\n', texto)
 
     return texto.strip()
@@ -177,10 +264,11 @@ def extract_text():
 
         response.raise_for_status()
 
-        content = response.text[:MAX_TEXT_LENGTH]
+        # Limita o tamanho do conteúdo recebido
+        texto_original = response.text[:MAX_TEXT_LENGTH]
 
-        # Limpa e organiza o texto extraído
-        content = limpar_texto(content)
+        # Limpa e organiza o conteúdo
+        content = limpar_texto(texto_original)
 
         if not content:
             return jsonify({
