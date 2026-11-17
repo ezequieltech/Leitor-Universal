@@ -58,6 +58,34 @@ def validate_public_url(value):
     return True
 
 
+def limpar_texto(texto):
+    # Remove links vazios
+    texto = re.sub(r'\[\]\[\d+\]', '', texto)
+
+    # Remove links de navegação sem conteúdo
+    texto = re.sub(r'\[\s*\]\([^)]+\)', '', texto)
+
+    # Remove controles de acessibilidade extraídos da página
+    texto = re.sub(r'(?m)^\s*(A\+|A-)\s*$', '', texto)
+
+    # Remove indicações de publicidade
+    texto = re.sub(
+        r'(?im)^\s*(Anuncie\s+\[?aqui\]?.*|publicidade)\s*$',
+        '',
+        texto
+    )
+
+    # Remove vídeos vazios
+    texto = re.sub(r'<video[^>]*>.*?</video>', '', texto,
+                   flags=re.DOTALL | re.IGNORECASE)
+
+    # Corrige espaços e quebras excessivas
+    texto = re.sub(r'[ \t]+', ' ', texto)
+    texto = re.sub(r' *\n *', '\n', texto)
+    texto = re.sub(r'\n{3,}', '\n\n', texto)
+
+    return texto.strip()
+
 @app.get("/")
 def index():
     return render_template("index.html")
@@ -99,6 +127,7 @@ def extract_text():
         response.raise_for_status()
 
         content = response.text[:MAX_TEXT_LENGTH]
+        content = limpar_texto(content)
 
         content = content.replace("\xa0", " ")
         content = re.sub(r"\n{3,}", "\n\n", content)
