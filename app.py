@@ -2,15 +2,14 @@
 import ipaddress
 import socket
 import re
-
 from urllib.parse import urlparse
 
 import requests
+import trafilatura
 
 from flask import Flask, jsonify, render_template, request
 from markdown_it import MarkdownIt
 from bs4 import BeautifulSoup, NavigableString, Tag
-
 
 app = Flask(__name__)
 
@@ -68,207 +67,175 @@ def validate_public_url(value):
     return True
 
 
-def remover_elementos_desnecessarios(texto):
-    """Remove elementos técnicos e publicidade."""
+def limpar_linhas(texto):
+    """Remove elementos que não fazem parte do conteúdo."""
 
-    # Remove cabeçalho técnico do Jina Reader
+    linhas = texto.splitlines()
+    resultado = []
+
+    remover = {
+        "seja premium",
+        "home",
+        "história do brasil",
+        "boa leitura!",
+        "deseja fazer uma citação?"
+    }
+
+    for linha in linhas:
+        limpa = linha.strip()
+
+        if limpa.casefold() in remover:
+            continue
+
+        if resultado and limpa:
+            if resultado[-1].strip().casefold() == limpa.casefold():
+                continue
+
+        resultado.append(linha)
+
+    return "\n".join(resultado).strip()
+
+
+def corrigir_separacoes(texto):
+    """Corrige alguns problemas comuns de espaçamento."""
+
+    # Separa palavras com inicial maiúscula no meio.
+    texto = re.sub(
+        r'(?<=[a-záéíóúâêôãõç])(?=[A-ZÁÉÍÓÚÂÊÔÃÕÇ])',
+        ' ',
+        texto
+    )
+
+    # Separa palavras em links de referência consecutivos.
+    texto = re.sub(
+        r'(\]\[\d+\])(?=\[)',
+        r'\1 ',
+        texto
+    )
+
+    # Corrige espaços antes de pontuação.
+    texto = re.sub(r'\s+([,.;:!?%)\]])', r'\1', texto)
+
+    # Garante espaço depois de vírgulas.
+    texto = re.sub(r',(?=\S)', ', ', texto)
+
+    # Corrige alguns problemas de autoria.
+    texto = re.sub(
+        r'(?i)Escrito por(?=[A-ZÁÉÍÓÚÂÊÔÃÕÇ])',
+        'Escrito por ',
+        texto
+    )
+
+    texto = re.sub(r'[ \t]+', ' ', texto)
+    texto = re.sub(r' *\n *', '\n', texto)
+    texto = re.sub(r'\n{3,}', '\n\n', texto)
+
+    return texto.strip()
+
+
+def extrair_com_trafilatura(url):
+    """Tenta extrair o conteúdo diretamente da página."""
+
+    resposta = requests.get(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 "
+                "(compatible; LeitorUniversal/2.0)"
+            )
+        },
+        timeout=TIMEOUT_SECONDS,
+        allow_redirects=False
+    )
+
+    resposta.raise_for_status()
+
+    if resposta.status_code != 200:
+        return None
+
+    texto = trafilatura.extract(
+        resposta.text,
+        output_format="txt",
+        include_comments=False,
+        include_tables=True,
+        favor_precision=True
+    )
+
+    return texto
+
+
+def extrair_com_jina(url):
+    """Usa Jina Reader como alternativa."""
+
+    resposta = requests.get(
+        "https://r.jina.ai/" + url,
+        headers={
+            "Accept": "text/plain",
+            "User-Agent": "LeitorUniversal/2.0",
+            "X-Respond-With": "markdown",
+            "X-Preset": "reader",
+            "X-Remove-Selector": (
+                "nav, footer, aside, form, "
+                "[role='navigation'], "
+                "[role='banner'], "
+                "[role='contentinfo'], "
+                ".advertisement, .ads, .sidebar, "
+                ".cookie, .newsletter, "
+                ".social-share, .related, .comments"
+            ),
+            "X-Retain-Images": "none"
+        },
+        timeout=TIMEOUT_SECONDS,
+        allow_redirects=False
+    )
+
+    resposta.raise_for_status()
+
+    texto = resposta.text[:MAX_TEXT_LENGTH]
+
+    # Remove informações técnicas do Jina.
     texto = re.sub(
         r'(?im)^\s*(Title|URL Source|Published Time|Markdown Content):.*$',
         '',
         texto
     )
 
-    # Remove controles e elementos de interface
-    texto = re.sub(
-        r'(?im)^\s*(Seja premium|A\+|A-|Copiar|publicidade)\s*$',
-        '',
-        texto
-    )
+    # Converte Markdown para HTML.
+    html = markdown.render(texto)
 
-    # Remove publicidade
-    texto = re.sub(
-        r'(?im)^\s*Anuncie\s+(?:\[?aqui\]?).*$',
-        '',
-        texto
-    )
-
-    # Remove vídeos vazios
-    texto = re.sub(
-        r'<video[^>]*>\s*</video>',
-        '',
-        texto,
-        flags=re.IGNORECASE
-    )
-
-    # Remove artigos relacionados no final
-    texto = re.sub(
-        r'(?ims)^#{1,6}\s*Artigos de .*$',
-        '',
-        texto
-    )
-
-    # Remove referências numéricas de links no final
-    texto = re.sub(
-        r'(?m)^\[\d+\]:\s*https?://.*(?:\n|$)',
-        '',
-        texto
-    )
-
-    return texto.strip()
-
-
-def extrair_texto_html(html):
-    """Converte HTML em texto organizado."""
-
+    # Extrai o texto do HTML.
     soup = BeautifulSoup(html, "html.parser")
 
-    # Remove elementos que não fazem parte do conteúdo textual
     for elemento in soup.find_all([
-        "script",
-        "style",
-        "noscript",
-        "svg",
-        "iframe",
-        "video",
-        "audio",
-        "nav",
-        "footer",
-        "aside",
-        "form"
+        "script", "style", "noscript", "svg",
+        "iframe", "video", "audio", "nav",
+        "footer", "aside", "form"
     ]):
         elemento.decompose()
 
-    partes = []
+    texto = soup.get_text(separator=" ", strip=True)
 
-    tags_de_bloco = {
-        "address", "article", "blockquote", "div",
-        "h1", "h2", "h3", "h4", "h5", "h6",
-        "li", "main", "ol", "p", "section", "table",
-        "tr", "ul"
-    }
-
-    tags_com_separacao = {
-        "a", "b", "strong", "em", "i", "code"
-    }
-
-    def percorrer(elemento):
-
-        if isinstance(elemento, NavigableString):
-            partes.append(str(elemento))
-            return
-
-        if not isinstance(elemento, Tag):
-            return
-
-        nome = elemento.name.lower()
-
-        if nome == "br":
-            partes.append("\n")
-            return
-
-        if nome in tags_de_bloco:
-            partes.append("\n")
-
-        elif nome in tags_com_separacao:
-            partes.append(" ")
-
-        for filho in elemento.children:
-            percorrer(filho)
-
-        if nome in tags_de_bloco:
-            partes.append("\n")
-
-        elif nome in tags_com_separacao:
-            partes.append(" ")
-
-    percorrer(soup)
-
-    texto = "".join(partes)
-
-    # Normaliza espaços
-    texto = re.sub(r'[ \t]+', ' ', texto)
-
-    # Corrige espaços antes de pontuação
-    texto = re.sub(r'\s+([,.;:!?%)\]])', r'\1', texto)
-
-    # Organiza parágrafos
-    texto = re.sub(r' *\n *', '\n', texto)
-    texto = re.sub(r'\n{3,}', '\n\n', texto)
-
-    return texto.strip()
+    return texto
 
 
 def limpar_texto(texto):
-    """Limpa Markdown e organiza o conteúdo para leitura por voz."""
+    """Prepara o conteúdo para leitura por voz."""
 
-    texto = remover_elementos_desnecessarios(texto)
+    if not texto:
+        return ""
 
-    # Remove referências vazias
-    texto = re.sub(r'\[\]\[\d+\]', '', texto)
+    texto = corrigir_separacoes(texto)
+    texto = limpar_linhas(texto)
 
-    # Remove links de navegação conhecidos
-    texto = re.sub(
-        r'(?im)^\s*\[(?:Home|História do Brasil)\](?:\[\d+\])?\s*$',
-        '',
-        texto
-    )
-
-    # Preserva o texto dos links e remove a referência numérica
-    texto = re.sub(
-        r'\[([^\]]+)\]\[\d+\]',
-        r'\1',
-        texto
-    )
-
-    # Remove referências vazias restantes
-    texto = re.sub(r'\[\s*\]\[\d+\]', '', texto)
-
-    # Converte Markdown em HTML
-    html = markdown.render(texto)
-
-    # Converte HTML em texto organizado
-    texto = extrair_texto_html(html)
-
-    # Remove marcações Markdown que eventualmente sobraram
+    # Remove marcações Markdown residuais.
     texto = re.sub(r'\*+', '', texto)
     texto = re.sub(r'(?<!\w)_|_(?!\w)', '', texto)
-
-    # Remove referências numéricas isoladas
     texto = re.sub(r'\[\d+\]', '', texto)
 
-    # Corrige espaços antes de pontuação
-    texto = re.sub(r'\s+([,.;:!?%)\]])', r'\1', texto)
-
-    # Garante espaço depois de pontuação quando necessário
-    texto = re.sub(
-        r'([.!?])(?=[A-ZÁÉÍÓÚÂÊÔÃÕÇ])',
-        r'\1 ',
-        texto
-    )
-
-    # Normaliza espaços
-    texto = texto.replace('\xa0', ' ')
     texto = re.sub(r'[ \t]+', ' ', texto)
-    texto = re.sub(r' *\n *', '\n', texto)
     texto = re.sub(r'\n{3,}', '\n\n', texto)
 
-    # Remove linhas consecutivas duplicadas
-    linhas = texto.splitlines()
-    resultado = []
-
-    for linha in linhas:
-        linha_limpa = linha.strip()
-
-        if (
-            linha_limpa
-            and resultado
-            and resultado[-1].strip().casefold() == linha_limpa.casefold()
-        ):
-            continue
-
-        resultado.append(linha)
-
-    return '\n'.join(resultado).strip()
+    return texto.strip()
 
 
 @app.get("/")
@@ -290,54 +257,59 @@ def extract_text():
             )
         }), 400
 
+    texto = None
+    metodo = None
+
+    # Primeira tentativa: Trafilatura.
     try:
-        response = requests.get(
-            "https://r.jina.ai/" + url,
-            headers={
-                "Accept": "text/plain",
-                "User-Agent": "LeitorUniversal/2.0",
-                "X-Respond-With": "markdown",
-                "X-Preset": "reader",
-                "X-Remove-Selector": (
-                    "nav, footer, aside, form, "
-                    "[role='navigation'], "
-                    "[role='banner'], "
-                    "[role='contentinfo'], "
-                    ".advertisement, .ads, .sidebar, "
-                    ".cookie, .newsletter, "
-                    ".social-share, .related, .comments"
-                ),
-                "X-Retain-Images": "none"
-            },
-            timeout=TIMEOUT_SECONDS
-        )
+        texto = extrair_com_trafilatura(url)
 
-        response.raise_for_status()
-
-        # Limita o tamanho do conteúdo
-        texto_original = response.text[:MAX_TEXT_LENGTH]
-
-        # Limpa e organiza o conteúdo
-        content = limpar_texto(texto_original)
-
-        if not content:
-            return jsonify({
-                "error": "Não foi possível encontrar texto nessa página."
-            }), 422
-
-        return jsonify({
-            "text": content,
-            "truncated": len(response.text) > MAX_TEXT_LENGTH
-        })
+        if texto and texto.strip():
+            metodo = "trafilatura"
 
     except requests.RequestException:
+        pass
+
+    except Exception:
+        pass
+
+    # Segunda tentativa: Jina Reader.
+    if not texto or not texto.strip():
+
+        try:
+            texto = extrair_com_jina(url)
+
+            if texto and texto.strip():
+                metodo = "jina"
+
+        except requests.RequestException:
+            pass
+
+        except Exception:
+            pass
+
+    if not texto or not texto.strip():
         return jsonify({
             "error": (
                 "Não foi possível extrair essa página. "
-                "Ela pode bloquear a leitura automática ou estar indisponível. "
+                "Ela pode bloquear a leitura automática "
+                "ou estar indisponível. "
                 "Você pode copiar o texto e colar na caixa abaixo."
             )
         }), 502
+
+    texto = texto[:MAX_TEXT_LENGTH]
+    texto = limpar_texto(texto)
+
+    if not texto:
+        return jsonify({
+            "error": "Não foi possível encontrar texto nessa página."
+        }), 422
+
+    return jsonify({
+        "text": texto,
+        "method": metodo
+    })
 
 
 @app.get("/health")
